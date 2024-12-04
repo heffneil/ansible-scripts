@@ -1,0 +1,253 @@
+- name: Configure Ubuntu
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  tasks:
+    - name: Update apt repo and cache
+      apt:
+        update_cache: yes
+        force_apt_get: yes
+
+    - name: Upgrade all packages
+      apt:
+        upgrade: 'yes'
+        force_apt_get: yes
+
+    - name: Gather hostname
+      shell: hostname
+      register: hostname
+
+    - name: Gather current username
+      user:
+        name: "{{ ansible_facts['env']['SUDO_USER'] }}"
+      register: username
+      changed_when: False
+
+    - name: Update sudo config
+      lineinfile:
+        path: "/etc/sudoers.d/{{ username.name }}"
+        regexp: "^{{ username.name }}"
+        line: "{{ username.name }} ALL=(ALL:ALL) NOPASSWD:ALL"
+        create: true
+
+    - name: Install required packages
+      apt:
+        name:
+          - apt-transport-https
+          - jq
+          - bash
+          - ca-certificates
+          - curl
+          - gnupg-agent
+          - software-properties-common
+          - chrony
+          - zip
+          - unzip
+          - openssl
+          - net-tools
+          - tcpdump
+          - telnet
+          - nano
+          - gnupg
+          - lsb-release
+          - sshfs
+          - wget
+          - tar
+          - rsync
+          - rename
+          - bridge-utils
+          - nfs-common
+        state: present
+        force_apt_get: yes
+
+    - name: Remove unnecessary packages
+      apt:
+        name:
+          - ufw
+          - mdadm
+          - open-iscsi
+          - lxd
+          - lxd-client
+          - lxcfs
+          - liblxc-common
+          - popularity-contest
+          - ubuntu-standard
+          - ubuntu-advantage-tools
+          - landscape-common
+        state: absent
+        autoremove: yes
+        force_apt_get: yes
+
+    - name: Create NFS mount point
+      file:
+        path: /mnt/cluster-backup
+        state: directory
+        mode: '0755'
+
+    - name: Check if fstab entry exists for NFS mount
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^192.168.10.40:/volume1/cluster-backup'
+        line: '192.168.10.40:/volume1/cluster-backup /mnt/cluster-backup nfs auto,defaults,nofail 0 0'
+        create: yes
+
+    - name: Mount the NFS share
+      shell: mount -a
+      register: mount_result
+
+    - name: Verify NFS mount
+      shell: df -h | grep "/mnt/cluster-backup"
+      register: nfs_mount_check
+      changed_when: nfs_mount_check.stdout == ""
+      failed_when: nfs_mount_check.stdout == ""
+
+    - name: Check for docker gpg key
+      stat:
+        path: /usr/share/keyrings/docker-archive-keyring.gpg
+      register: docker_gpg_key
+
+    - name: Install docker gpg key
+      shell: curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+      when: not docker_gpg_key.stat.exists
+      args:
+        warn: false
+
+    - name: Check for docker repo source definition
+      stat:
+        path: /etc/apt/sources.list.d/docker.list
+      register: docker_src_list
+
+    - name: Add Docker Repository
+      shell: echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+      when: not docker_src_list.stat.exists
+      args:
+        warn: false
+
+    - name: Update apt and install docker-ce
+      apt:
+        update_cache: yes
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        force_apt_get: yes
+
+    - name: Create '/etc/docker'
+      ansible.builtin.file:
+        path: /etc/docker
+        state: directory
+        mode: '0755'
+
+    - name: Configure Docker logging limits
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "10"
+            }
+          }
+      register: docker_daemon_json
+
+    - name: Restart Docker to apply new config
+      shell: systemctl restart docker
+      when: docker_daemon_json.changed
+      args:
+        warn: false
+
+    - name: Get Docker compose version (latest release)
+      uri:
+        url: https://github.com/docker/compose/releases/latest
+      register: latest_compose
+
+    - name: Download Docker compose module (latest release)
+      get_url:
+        url: "{{ latest_compose.url | replace('/tag/','/download/') }}/docker-compose-linux-x86_64"
+        dest: /usr/libexec/docker/cli-plugins/docker-compose
+        mode: '755'
+
+    - name: Create /docker
+      file:
+        path: /docker
+        state: directory
+        mode: '0755'
+
+    - name: Create /docker/services
+      file:
+        path: /docker/services
+        state: directory
+        mode: '0755'
+
+    - name: Write Dozzle Docker Compose service file
+      copy:
+        dest: /docker/services/dozzle.yml
+        content: |
+          version: '3.9'
+          services:
+            dozzle:
+              container_name: dozzle
+              image: amir20/dozzle:latest
+              volumes:
+                - /var/run/docker.sock:/var/run/docker.sock
+              ports:
+                - 8080:8080
+              restart: unless-stopped
+        mode: '0644'
+
+    - name: Write top-level Docker Compose file
+      copy:
+        dest: /docker/docker-compose.yaml
+        content: |
+          services:
+            dozzle:
+              extends:
+                file: ./services/dozzle.yml
+                service: dozzle
+        mode: '0644'
+
+    - name: Enable separate cron logging
+      lineinfile:
+        path: /etc/rsyslog.d/50-default.conf
+        regexp: '^#cron.*'
+        line: 'cron.*                           /var/log/cron.log'
+      register: cron_log_config
+
+    - name: Reload rsyslog daemon configurations
+      shell: systemctl restart rsyslog.service
+      when: cron_log_config.changed
+
+    - name: Create app interface systemd unit file
+      copy:
+        dest: /etc/systemd/system/appif.service
+        content: |
+          [Unit]
+          Description=Service to bring up/down app interface
+          After=network.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/bin/sh -c "/sbin/ip link add name app type dummy 2> /dev/null || true; \
+                    /sbin/ip addr add 169.254.254.254/24 dev app; \
+                    /sbin/ip link set app up 2> /dev/null || true"
+          ExecStop=/sbin/ip link set app down
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0444'
+      register: appif_service
+
+    - name: Reload system daemon configurations
+      shell: systemctl daemon-reload
+      when: appif_service.changed
+
+    - name: Enable app interface service
+      shell: systemctl enable appif
+      when: appif_service.changed
+
+    - name: Enable app interface service
+      shell: systemctl start appif
+      when: appif_service.changed
